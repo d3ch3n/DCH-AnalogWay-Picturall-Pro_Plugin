@@ -1,7 +1,18 @@
-local DefaultPort = 5000
+-- Analog Way Picturall Pro external control
+--
+-- Protocol source notes:
+-- * Analog Way describes Picturall external control as Ethernet TCP/IP with a
+--   comprehensive text based protocol.
+-- * The Bitfocus Companion Analog Way Picturall module documents the default
+--   control TCP port as 11000 and recommends using Picturall Commander logging
+--   or Companion Learn to obtain the exact "set ..." command strings.
+-- * Picturall Server 3.5.x supports cue stacks/playbacks. This plugin sends
+--   operator-configured textual commands and does not assume undocumented
+--   commands for the target show file.
+
+local DefaultPort = 11000
 local DefaultTimeout = 5
-local DefaultPollInterval = 15
-local DefaultFastPollInterval = 5
+local DefaultPollInterval = 10
 
 local Status = {
   OK = 0,
@@ -12,49 +23,20 @@ local Status = {
   Initializing = 5
 }
 
-local Commands = {
-  RecallDefaults = 0x04,
-  Brightness = 0x10,
-  Contrast = 0x12,
-  AutoAdjust = 0x1E,
-  Input = 0x60,
-  VolumeStep = 0x61,
-  Volume = 0x62,
-  Temperature = 0xB1,
-  Lifetime = 0xC0,
-  Touch = 0xC7,
-  Power = 0xD6
-}
-
-local SourceValues = {
-  ["HDMI 1"] = 0x20,
-  ["HDMI 2"] = 0x10,
-  ["DisplayPort"] = 0x40,
-  ["USB-C"] = 0x08,
-  ["Side HDMI"] = 0x04,
-  ["ECM HDMI"] = 0x02,
-  ["ECM DP"] = 0x01,
-  ["VGA"] = 0x80
-}
-
-local SourceNames = {}
-for name, value in pairs(SourceValues) do
-  SourceNames[value] = name
-end
-
 local socket = nil
 local timeoutTimer = Timer.New()
 local pollTimer = Timer.New()
-local fastPollTimer = Timer.New()
 local retryTimer = Timer.New()
-local levelTimers = {}
-local pendingLevelValues = {}
 local queue = {}
 local currentCommand = nil
 local rxBuffer = ""
-local updatingFeedback = false
 local socketConnected = false
-local currentPowerState = nil
+local updatingFeedback = false
+local lastRequestedPreset = nil
+local activeCueStack = ""
+local activePlayback = ""
+local activeCue = ""
+local playbackState = ""
 
 local function HasControl(name)
   return Controls[name] ~= nil
@@ -109,12 +91,6 @@ local function SetControlString(name, value)
   end
 end
 
-local function SetControlValue(name, value)
-  if HasControl(name) then
-    Control(name).Value = tonumber(value) or 0
-  end
-end
-
 local function SetControlBoolean(name, value)
   if HasControl(name) then
     local state = value and true or false
@@ -122,6 +98,26 @@ local function SetControlBoolean(name, value)
     Control(name).Value = state and 1 or 0
     Control(name).Position = state and 1 or 0
   end
+end
+
+local function PresetCount()
+  local count = math.floor(tonumber(GetProperty("Preset Count", 5)) or 5)
+  if count < 1 then
+    return 1
+  elseif count > 24 then
+    return 24
+  end
+  return count
+end
+
+local function PlaybackCount()
+  local count = math.floor(tonumber(GetProperty("Playback Count", 8)) or 8)
+  if count < 1 then
+    return 1
+  elseif count > 8 then
+    return 8
+  end
+  return count
 end
 
 local function Port()
@@ -149,251 +145,165 @@ local function ResponseTimeout()
 end
 
 local function RetryCount()
-  return tonumber(GetProperty("Retry Count", 2)) or 2
-end
-
-local function PollInterval()
-  return tonumber(GetProperty("Poll Interval", DefaultPollInterval)) or DefaultPollInterval
-end
-
-local function FastPollInterval()
-  return tonumber(GetProperty("Fast Poll Interval", DefaultFastPollInterval)) or DefaultFastPollInterval
+  return tonumber(GetProperty("Retry Count", 1)) or 1
 end
 
 local function RetryDelay()
   return tonumber(GetProperty("Retry Delay", 5)) or 5
 end
 
-local function ClampPercent(value)
-  value = math.floor(tonumber(value) or 0)
-  if value < 0 then
-    return 0
-  elseif value > 100 then
-    return 100
+local function PollInterval()
+  return tonumber(GetProperty("Poll Interval", DefaultPollInterval)) or DefaultPollInterval
+end
+
+local function DefaultPlayback()
+  local value = math.floor(tonumber(GetProperty("Default Playback", 1)) or 1)
+  if value < 1 then
+    return 1
+  elseif value > 8 then
+    return 8
   end
   return value
 end
 
-local function Hex(data)
-  local out = {}
-  for i = 1, #data do
-    table.insert(out, string.format("%02X", string.byte(data, i)))
+local function LineEnding()
+  local value = tostring(GetProperty("Line Ending", "LF"))
+  if value == "CRLF" then
+    return "\r\n"
+  elseif value == "CR" then
+    return "\r"
+  elseif value == "None" then
+    return ""
   end
-  return table.concat(out, " ")
+  return "\n"
 end
 
-local function BuildFrame(command, rw, values)
-  values = values or {}
-  local bytes = {0x6E, 0x80 + 3 + #values, 0xFF, rw, command}
-  for _, value in ipairs(values) do
-    table.insert(bytes, value)
-  end
-  local checksum = 0
-  for _, byte in ipairs(bytes) do
-    checksum = (checksum + byte) % 256
-  end
-  local frame = {0x02}
-  for _, byte in ipairs(bytes) do
-    table.insert(frame, byte)
-  end
-  table.insert(frame, checksum)
-  table.insert(frame, 0x03)
-  local chars = {}
-  for _, byte in ipairs(frame) do
-    table.insert(chars, string.char(byte))
-  end
-  return table.concat(chars)
+local function Trim(value)
+  value = tostring(value or "")
+  value = string.gsub(value, "^%s+", "")
+  value = string.gsub(value, "%s+$", "")
+  return value
 end
 
-local function ReadFrame(command)
-  return BuildFrame(command, 0x01, {})
+local function PresetName(ix)
+  local configured = Trim(HasControl("Preset" .. ix .. "Name") and Control("Preset" .. ix .. "Name").String or "")
+  if configured ~= "" then
+    return configured
+  end
+  return "Preset " .. ix
 end
 
-local function WriteFrame(command, values)
-  return BuildFrame(command, 0x04, values)
+local function PresetPlayback(ix)
+  local configured = Trim(HasControl("Preset" .. ix .. "Playback") and Control("Preset" .. ix .. "Playback").String or "")
+  local numeric = tonumber(configured)
+  if numeric ~= nil then
+    return tostring(math.floor(numeric))
+  end
+  return tostring(DefaultPlayback())
 end
 
-local function SetPowerUnknown()
-  currentPowerState = nil
+local function PresetCueStack(ix)
+  return Trim(HasControl("Preset" .. ix .. "CueStack") and Control("Preset" .. ix .. "CueStack").String or "")
+end
+
+local function PresetCommand(ix)
+  return Trim(HasControl("Preset" .. ix .. "Command") and Control("Preset" .. ix .. "Command").String or "")
+end
+
+local function PlaybackGoCommand(ix)
+  return Trim(HasControl("Playback" .. ix .. "GoCommand") and Control("Playback" .. ix .. "GoCommand").String or "")
+end
+
+local function DefaultPlaybackGoCommand(ix)
+  return "set stack" .. ix .. " control command=1"
+end
+
+local function ApplyPresetActiveFeedback()
   updatingFeedback = true
-  SetControlBoolean("PowerOn", false)
-  SetControlBoolean("PowerOff", false)
-  SetControlBoolean("PowerIsOn", false)
-  SetControlBoolean("PowerIsOff", false)
-  SetControlString("PowerStatus", "Unknown")
-  updatingFeedback = false
-end
-
-local function UpdatePower(value)
-  local on = value == 0x01
-  local off = value == 0x05 or value == 0x00
-  updatingFeedback = true
-  if on then
-    currentPowerState = true
-    SetControlBoolean("PowerOn", true)
-    SetControlBoolean("PowerOff", false)
-    SetControlBoolean("Power", true)
-    SetControlBoolean("PowerIsOn", true)
-    SetControlBoolean("PowerIsOff", false)
-    SetControlString("PowerStatus", "ON")
-  elseif off then
-    currentPowerState = false
-    SetControlBoolean("PowerOn", false)
-    SetControlBoolean("PowerOff", true)
-    SetControlBoolean("Power", false)
-    SetControlBoolean("PowerIsOn", false)
-    SetControlBoolean("PowerIsOff", true)
-    SetControlString("PowerStatus", "OFF")
-  else
-    SetControlString("PowerStatus", string.format("0x%02X", value or 0))
+  for ix = 1, PresetCount() do
+    local cueStack = PresetCueStack(ix)
+    local playback = PresetPlayback(ix)
+    local matchedByFeedback = activeCueStack ~= "" and cueStack ~= "" and activeCueStack == cueStack and activePlayback == playback
+    local pending = lastRequestedPreset == ix and activeCueStack == ""
+    SetControlBoolean("Preset" .. ix .. "Active", matchedByFeedback or pending)
+  end
+  for ix = 1, PlaybackCount() do
+    SetControlBoolean("Playback" .. ix .. "Active", activePlayback == tostring(ix))
   end
   updatingFeedback = false
 end
 
-local function UpdateSource(value)
-  local source = SourceNames[value] or string.format("0x%02X", value or 0)
-  updatingFeedback = true
-  SetControlString("CurrentSource", source)
-  if SourceValues[source] ~= nil then
-    SetControlString("SourceSelect", source)
+local function UpdatePlaybackFeedback(playback, cueStack, cue, state)
+  if playback ~= nil and playback ~= "" then
+    activePlayback = tostring(playback)
+    SetControlString("ActivePlayback", activePlayback)
   end
-  SetControlBoolean("HDMI1Active", value == SourceValues["HDMI 1"])
-  SetControlBoolean("HDMI2Active", value == SourceValues["HDMI 2"])
-  SetControlBoolean("DPActive", value == SourceValues["DisplayPort"])
-  SetControlBoolean("USBCActive", value == SourceValues["USB-C"])
-  updatingFeedback = false
+  if cueStack ~= nil and cueStack ~= "" then
+    activeCueStack = tostring(cueStack)
+    SetControlString("ActiveCueStack", activeCueStack)
+  end
+  if cue ~= nil and cue ~= "" then
+    activeCue = tostring(cue)
+    SetControlString("ActiveCue", activeCue)
+  end
+  if state ~= nil and state ~= "" then
+    playbackState = tostring(state)
+    SetControlString("PlaybackState", playbackState)
+  end
+  ApplyPresetActiveFeedback()
 end
 
-local function UpdateTouch(value)
-  local enabled = value == 0x01
-  updatingFeedback = true
-  SetControlBoolean("TouchEnabled", enabled)
-  SetControlString("TouchStatus", enabled and "ON" or "OFF")
-  updatingFeedback = false
-end
+local function ParseFeedbackLine(line)
+  local text = Trim(line)
+  if text == "" then
+    return
+  end
+  DebugPrint("Rx", "RX: " .. text)
+  SetControlString("CommandStatus", text)
 
-local function WordAt(data, index)
-  local high = string.byte(data, index) or 0
-  local low = string.byte(data, index + 1) or 0
-  return high * 256 + low
-end
+  local version = string.match(text, "[Vv]ersion[%s:=]+([%w%._%-]+)")
+  if version ~= nil then
+    SetControlString("ServerVersion", version)
+  end
 
-local function HandleReadResponse(command, data)
-  if command == Commands.Power then
-    UpdatePower(string.byte(data, 2) or string.byte(data, 1))
-  elseif command == Commands.Input then
-    UpdateSource(string.byte(data, 1))
-  elseif command == Commands.Volume then
-    local current = string.byte(data, 4) or string.byte(data, 2) or 0
-    updatingFeedback = true
-    SetControlValue("Volume", current)
-    SetControlString("VolumeFeedback", tostring(current))
-    updatingFeedback = false
-  elseif command == Commands.Brightness then
-    local current = string.byte(data, 4) or WordAt(data, 3)
-    updatingFeedback = true
-    SetControlValue("Brightness", current)
-    SetControlString("BrightnessFeedback", tostring(current))
-    updatingFeedback = false
-  elseif command == Commands.Contrast then
-    local current = string.byte(data, 4) or WordAt(data, 3)
-    updatingFeedback = true
-    SetControlValue("Contrast", current)
-    SetControlString("ContrastFeedback", tostring(current))
-    updatingFeedback = false
-  elseif command == Commands.Temperature then
-    local temp = WordAt(data, 3)
-    SetControlString("Temperature", tostring(temp) .. " C")
-  elseif command == Commands.Lifetime then
-    SetControlString("PowerHours", tostring(WordAt(data, 1)))
-    SetControlString("BacklightHours", tostring(WordAt(data, 3)))
-  elseif command == Commands.Touch then
-    UpdateTouch(string.byte(data, 2) or string.byte(data, 1))
+  local playback, cueStack = string.match(text, "[Pp]layback%s*(%d+).-[Cc]ue[Ss]tack[%s:=]+([%w%._%-]+)")
+  if playback == nil then
+    playback, cueStack = string.match(text, "playback(%d+)_cuestack[%s:=]+([%w%._%-]+)")
+  end
+  if playback == nil then
+    playback, cueStack = string.match(text, "playback(%d+)_questack[%s:=]+([%w%._%-]+)")
+  end
+  local cue = string.match(text, "[Cc]ue[%s:=]+([%d%.]+)")
+  local state = string.match(text, "[Ss]tate[%s:=]+(.+)")
+
+  if playback ~= nil or cueStack ~= nil or cue ~= nil or state ~= nil then
+    UpdatePlaybackFeedback(playback, cueStack, cue, state)
   end
 end
 
-local function HandleWriteAck(command, errorCode)
-  if errorCode == 0x04 then
-    SetControlString("CommandStatus", "OK")
-    if command == Commands.Power and currentCommand ~= nil then
-      local value = currentCommand.values[2]
-      UpdatePower(value)
-    elseif command == Commands.Input and currentCommand ~= nil then
-      UpdateSource(currentCommand.values[1])
-    elseif command == Commands.Touch and currentCommand ~= nil then
-      UpdateTouch(currentCommand.values[2])
-    end
-  else
-    SetControlString("CommandStatus", string.format("Error 0x%02X", errorCode or 0))
-    SetStatus(Status.Compromised, "Command rejected")
-  end
-end
-
-local function ParseFrame(frame)
-  if #frame < 8 then
-    return nil
-  end
-  local checksum = 0
-  for i = 2, #frame - 2 do
-    checksum = (checksum + (string.byte(frame, i) or 0)) % 256
-  end
-  local received = string.byte(frame, #frame - 1) or 0
-  if checksum ~= received then
-    DebugPrint("Rx", "RX checksum mismatch: " .. Hex(frame))
-  end
-  local rwOrError = string.byte(frame, 5)
-  local command = string.byte(frame, 6)
-  local data = ""
-  if #frame > 8 then
-    data = string.sub(frame, 7, #frame - 2)
-  end
-  return {rwOrError = rwOrError, command = command, data = data, raw = frame}
-end
-
-local function ExtractFrames()
-  local frames = {}
+local function ExtractLines(data)
+  rxBuffer = rxBuffer .. data
+  local lines = {}
   while true do
-    local start = string.find(rxBuffer, string.char(0x02), 1, true)
-    if start == nil then
-      rxBuffer = ""
+    local lf = string.find(rxBuffer, "\n", 1, true)
+    if lf == nil then
       break
     end
-    if start > 1 then
-      rxBuffer = string.sub(rxBuffer, start)
-    end
-    if #rxBuffer < 5 then
-      break
-    end
-    local lengthByte = string.byte(rxBuffer, 3) or 0x80
-    local bodyLength = lengthByte - 0x80
-    if bodyLength < 0 then
-      rxBuffer = string.sub(rxBuffer, 2)
-    else
-      local frameLength = bodyLength + 5
-      if #rxBuffer < frameLength then
-        break
-      end
-      local frame = string.sub(rxBuffer, 1, frameLength)
-      rxBuffer = string.sub(rxBuffer, frameLength + 1)
-      if string.byte(frame, #frame) == 0x03 then
-        table.insert(frames, frame)
-      else
-        DebugPrint("Rx", "RX invalid frame: " .. Hex(frame))
-      end
-    end
+    table.insert(lines, Trim(string.sub(rxBuffer, 1, lf - 1)))
+    rxBuffer = string.sub(rxBuffer, lf + 1)
   end
-  return frames
+  if #rxBuffer > 0 and string.find(rxBuffer, "\r", 1, true) ~= nil then
+    local cr = string.find(rxBuffer, "\r", 1, true)
+    table.insert(lines, Trim(string.sub(rxBuffer, 1, cr - 1)))
+    rxBuffer = string.sub(rxBuffer, cr + 1)
+  end
+  return lines
 end
 
 CommandQueue = {}
 
 function CommandQueue.Add(item)
   table.insert(queue, item)
-  CommandQueue.Process()
-end
-
-function CommandQueue.AddPriority(item)
-  table.insert(queue, 1, item)
   CommandQueue.Process()
 end
 
@@ -411,8 +321,8 @@ function CommandQueue.SendCurrent()
   if currentCommand == nil or socket == nil or not socketConnected then
     return
   end
-  DebugPrint("Tx", "TX: " .. Hex(currentCommand.frame))
-  socket:Write(currentCommand.frame)
+  DebugPrint("Tx", "TX: " .. currentCommand.command)
+  socket:Write(currentCommand.command .. LineEnding())
   timeoutTimer:Start(ResponseTimeout())
 end
 
@@ -424,8 +334,10 @@ function CommandQueue.Timeout()
     currentCommand.retries = currentCommand.retries + 1
     CommandQueue.SendCurrent()
   else
-    SetStatus(Status.Fault, "Response timeout")
+    DebugPrint("Function Calls", "No response for command: " .. currentCommand.command)
+    SetControlString("CommandStatus", "No response: " .. currentCommand.label)
     currentCommand = nil
+    SetStatus(Status.Compromised, "Command sent, no feedback")
     CommandQueue.Process()
   end
 end
@@ -436,68 +348,26 @@ function CommandQueue.Clear()
   timeoutTimer:Stop()
 end
 
-local function AddRead(command, priority)
-  local item = {frame = ReadFrame(command), command = command, rw = 0x01, values = {}, retries = 0}
-  if priority then
-    CommandQueue.AddPriority(item)
-  else
-    CommandQueue.Add(item)
-  end
-end
-
-local function AddWrite(command, values)
-  CommandQueue.AddPriority({frame = WriteFrame(command, values), command = command, rw = 0x04, values = values, retries = 0})
-end
-
-local function Poll()
-  AddRead(Commands.Power)
-  AddRead(Commands.Input)
-  AddRead(Commands.Volume)
-  AddRead(Commands.Brightness)
-  AddRead(Commands.Contrast)
-  if PropIsYes("Enable Touch Control", true) then
-    AddRead(Commands.Touch)
-  end
-  if PropIsYes("Enable Diagnostics", true) then
-    AddRead(Commands.Temperature)
-    AddRead(Commands.Lifetime)
-  end
-end
-
-local function FastPoll()
-  AddRead(Commands.Power, true)
-  AddRead(Commands.Input, true)
-  AddRead(Commands.Volume, true)
-  AddRead(Commands.Brightness, true)
-  AddRead(Commands.Contrast, true)
-  fastPollTimer:Stop()
-end
-
-local function CompleteCurrent(frame)
-  local parsed = ParseFrame(frame)
-  if parsed == nil then
+local function QueueCommand(command, label)
+  command = Trim(command)
+  if command == "" then
+    SetControlString("CommandStatus", "Missing command")
+    SetStatus(Status.Compromised, "Missing preset command")
     return
   end
-  DebugPrint("Rx", "RX: " .. Hex(frame))
-  if currentCommand ~= nil and parsed.command == currentCommand.command then
-    if currentCommand.rw == 0x04 then
-      HandleWriteAck(parsed.command, parsed.rwOrError)
-    else
-      HandleReadResponse(parsed.command, parsed.data)
-    end
-    timeoutTimer:Stop()
-    currentCommand = nil
-    SetStatus(Status.OK, "OK")
-    CommandQueue.Process()
-  else
-    HandleReadResponse(parsed.command, parsed.data)
-  end
+  CommandQueue.Add({command = command, label = label or command, retries = 0})
+end
+
+local function PollFeedback()
+  -- Picturall's public integration guidance recommends learning exact command
+  -- names from Commander logs. Keep polling conservative and rely on passive
+  -- status messages unless the site-specific show exposes query commands.
+  ApplyPresetActiveFeedback()
 end
 
 local function CloseSocket()
   CommandQueue.Clear()
   pollTimer:Stop()
-  fastPollTimer:Stop()
   if socket ~= nil then
     socket:Disconnect()
   end
@@ -507,10 +377,9 @@ end
 
 local function ScheduleRetry(reason)
   pollTimer:Stop()
-  fastPollTimer:Stop()
   SetConnected(false)
   if reason ~= nil and reason ~= "" then
-    SetStatus(Status.Fault, reason)
+    DebugPrint("Function Calls", "Connection closed: " .. tostring(reason))
   end
   retryTimer:Start(RetryDelay())
   SetStatus(Status.Compromised, "Reconnecting")
@@ -528,22 +397,29 @@ local function OpenSocket()
   retryTimer:Stop()
   CommandQueue.Clear()
   pollTimer:Stop()
-  fastPollTimer:Stop()
 
   if socket == nil then
     socket = TcpSocket.New()
     socket.EventHandler = function(sock, event, err)
       if event == TcpSocket.Events.Connected then
+        DebugPrint("Function Calls", "Connected")
         SetConnected(true)
-        SetStatus(Status.Compromised, "Connected, waiting for feedback")
-        SetPowerUnknown()
-        Poll()
-        pollTimer:Start(PollInterval())
+        SetStatus(Status.OK, "Connected")
+        PollFeedback()
+        if PropIsYes("Enable Feedback Polling", true) then
+          pollTimer:Start(PollInterval())
+        end
       elseif event == TcpSocket.Events.Data then
         local data = sock:Read(sock.BufferLength)
-        rxBuffer = rxBuffer .. data
-        for _, frame in ipairs(ExtractFrames()) do
-          CompleteCurrent(frame)
+        local lines = ExtractLines(data)
+        for _, line in ipairs(lines) do
+          ParseFeedbackLine(line)
+        end
+        if currentCommand ~= nil and #lines > 0 then
+          timeoutTimer:Stop()
+          currentCommand = nil
+          SetStatus(Status.OK, "OK")
+          CommandQueue.Process()
         end
       elseif event == TcpSocket.Events.Closed or event == TcpSocket.Events.Error or event == TcpSocket.Events.Timeout then
         ScheduleRetry(err or "Connection Error")
@@ -559,64 +435,64 @@ end
 local function InitializeControls()
   SetControlString("IPAddress", IPAddress())
   SetControlString("TCPPort", Port())
-  SetPowerUnknown()
-  SetControlString("CurrentSource", "")
-  SetControlString("VolumeFeedback", "")
-  SetControlString("BrightnessFeedback", "")
-  SetControlString("ContrastFeedback", "")
+  SetControlString("ServerVersion", "")
+  SetControlString("ActivePlayback", tostring(DefaultPlayback()))
+  SetControlString("ActiveCueStack", "")
+  SetControlString("ActiveCue", "")
+  SetControlString("PlaybackState", "")
+  SetControlString("CommandStatus", "")
+  for ix = 1, PresetCount() do
+    if HasControl("Preset" .. ix .. "Name") and Trim(Control("Preset" .. ix .. "Name").String) == "" then
+      SetControlString("Preset" .. ix .. "Name", "Preset " .. ix)
+    end
+    if HasControl("Preset" .. ix .. "Playback") and Trim(Control("Preset" .. ix .. "Playback").String) == "" then
+      SetControlString("Preset" .. ix .. "Playback", tostring(DefaultPlayback()))
+    end
+  end
+  for ix = 1, PlaybackCount() do
+    if HasControl("Playback" .. ix .. "GoCommand") and Trim(Control("Playback" .. ix .. "GoCommand").String) == "" then
+      SetControlString("Playback" .. ix .. "GoCommand", DefaultPlaybackGoCommand(ix))
+    end
+    SetControlBoolean("Playback" .. ix .. "Active", ix == DefaultPlayback())
+  end
   SetConnected(false)
   SetStatus(Status.Initializing, "Initializing")
   OpenSocket()
 end
 
-local function QueuePower(powerState)
-  local value = powerState and 0x01 or 0x05
-  AddWrite(Commands.Power, {0x00, value})
-  AddRead(Commands.Power)
-  fastPollTimer:Start(FastPollInterval())
-end
-
-local function QueueSource(sourceName)
-  local value = SourceValues[sourceName]
-  if value ~= nil then
-    AddWrite(Commands.Input, {value})
-    AddRead(Commands.Input)
-    fastPollTimer:Start(FastPollInterval())
+local function RecallPreset(ix)
+  local command = PresetCommand(ix)
+  if command == "" then
+    SetControlString("CommandStatus", "Preset " .. ix .. " command is empty")
+    SetStatus(Status.Compromised, "Missing preset command")
+    return
   end
+  lastRequestedPreset = ix
+  activePlayback = PresetPlayback(ix)
+  SetControlString("ActivePlayback", activePlayback)
+  SetControlString("CommandStatus", "Requesting " .. PresetName(ix))
+  ApplyPresetActiveFeedback()
+  DebugPrint("Function Calls", "Cue stack requested: " .. PresetName(ix))
+  QueueCommand(command, PresetName(ix))
 end
 
-local function QueuePercent(command, value)
-  value = ClampPercent(value)
-  AddWrite(command, {0x00, value})
-  AddRead(command)
-end
-
-local function BindDebouncedLevel(name, command, delay)
-  if HasControl(name) then
-    levelTimers[name] = Timer.New()
-    levelTimers[name].EventHandler = function()
-      levelTimers[name]:Stop()
-      if pendingLevelValues[name] == nil then
-        return
-      end
-      local value = pendingLevelValues[name]
-      pendingLevelValues[name] = nil
-      QueuePercent(command, value)
-    end
-    Control(name).EventHandler = function(control)
-      if updatingFeedback then
-        return
-      end
-      pendingLevelValues[name] = ClampPercent(control.Value or 0)
-      levelTimers[name]:Stop()
-      levelTimers[name]:Start(delay or 0.75)
-    end
+local function PlaybackGo(ix)
+  local command = PlaybackGoCommand(ix)
+  if command == "" then
+    SetControlString("CommandStatus", "Playback " .. ix .. " Go command is empty")
+    SetStatus(Status.Compromised, "Missing playback command")
+    return
   end
+  activePlayback = tostring(ix)
+  SetControlString("ActivePlayback", activePlayback)
+  SetControlString("CommandStatus", "Playback " .. ix .. " Go")
+  ApplyPresetActiveFeedback()
+  DebugPrint("Function Calls", "Playback Go requested: " .. ix)
+  QueueCommand(command, "Playback " .. ix .. " Go")
 end
 
 timeoutTimer.EventHandler = CommandQueue.Timeout
-pollTimer.EventHandler = Poll
-fastPollTimer.EventHandler = FastPoll
+pollTimer.EventHandler = PollFeedback
 retryTimer.EventHandler = OpenSocket
 
 if HasControl("IPAddress") then
@@ -633,81 +509,29 @@ if HasControl("TCPPort") then
   end
 end
 
-if HasControl("PowerOn") then
-  Control("PowerOn").EventHandler = function(control)
-    if not updatingFeedback and control.Boolean then
-      QueuePower(true)
+if HasControl("PollFeedback") then
+  Control("PollFeedback").EventHandler = PollFeedback
+end
+
+for ix = 1, PlaybackCount() do
+  if HasControl("Playback" .. ix .. "Go") then
+    Control("Playback" .. ix .. "Go").EventHandler = function()
+      PlaybackGo(ix)
     end
   end
 end
 
-if HasControl("PowerOff") then
-  Control("PowerOff").EventHandler = function(control)
-    if not updatingFeedback and control.Boolean then
-      QueuePower(false)
+for ix = 1, PresetCount() do
+  if HasControl("Preset" .. ix .. "Go") then
+    Control("Preset" .. ix .. "Go").EventHandler = function()
+      RecallPreset(ix)
     end
   end
-end
-
-if HasControl("Power") then
-  Control("Power").EventHandler = function(control)
-    if not updatingFeedback then
-      QueuePower(control.Boolean)
-    end
+  if HasControl("Preset" .. ix .. "CueStack") then
+    Control("Preset" .. ix .. "CueStack").EventHandler = ApplyPresetActiveFeedback
   end
-end
-
-if HasControl("PowerPoll") then
-  Control("PowerPoll").EventHandler = function()
-    AddRead(Commands.Power, true)
-  end
-end
-
-if HasControl("SourceSelect") then
-  Control("SourceSelect").EventHandler = function(control)
-    if not updatingFeedback then
-      QueueSource(control.String)
-    end
-  end
-end
-
-if HasControl("SourceHDMI1") then Control("SourceHDMI1").EventHandler = function() QueueSource("HDMI 1") end end
-if HasControl("SourceHDMI2") then Control("SourceHDMI2").EventHandler = function() QueueSource("HDMI 2") end end
-if HasControl("SourceDP") then Control("SourceDP").EventHandler = function() QueueSource("DisplayPort") end end
-if HasControl("SourceUSBC") then Control("SourceUSBC").EventHandler = function() QueueSource("USB-C") end end
-
-BindDebouncedLevel("Volume", Commands.Volume, 0.75)
-BindDebouncedLevel("Brightness", Commands.Brightness, 0.75)
-BindDebouncedLevel("Contrast", Commands.Contrast, 0.75)
-
-if HasControl("VolumeUp") then Control("VolumeUp").EventHandler = function() AddWrite(Commands.VolumeStep, {0x00, 0x01}); AddRead(Commands.Volume) end end
-if HasControl("VolumeDown") then Control("VolumeDown").EventHandler = function() AddWrite(Commands.VolumeStep, {0x01, 0x01}); AddRead(Commands.Volume) end end
-
-if HasControl("TouchEnabled") then
-  Control("TouchEnabled").EventHandler = function(control)
-    if not updatingFeedback then
-      AddWrite(Commands.Touch, {0x00, control.Boolean and 0x01 or 0x00})
-      AddRead(Commands.Touch)
-    end
-  end
-end
-
-if HasControl("ReadStatus") then
-  Control("ReadStatus").EventHandler = function()
-    Poll()
-  end
-end
-
-if HasControl("RecallDefaults") then
-  Control("RecallDefaults").EventHandler = function()
-    AddWrite(Commands.RecallDefaults, {0x00, 0x01})
-    fastPollTimer:Start(FastPollInterval())
-  end
-end
-
-if HasControl("AutoAdjust") then
-  Control("AutoAdjust").EventHandler = function()
-    AddWrite(Commands.AutoAdjust, {0x00, 0x01})
+  if HasControl("Preset" .. ix .. "Playback") then
+    Control("Preset" .. ix .. "Playback").EventHandler = ApplyPresetActiveFeedback
   end
 end
 

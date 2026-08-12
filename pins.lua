@@ -1,1 +1,1 @@
--- No unmanaged pins are required for the Elo IDS plugin.
+-- No unmanaged pins are required for the Picturall Pro plugin.

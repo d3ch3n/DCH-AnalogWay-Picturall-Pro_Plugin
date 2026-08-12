@@ -6,17 +6,34 @@ local PanelStroke = {30,30,30}
 local ButtonGray = {105,105,105}
 local ButtonBlue = {0,185,230}
 local Green = {0,145,0}
-local Red = {190,60,55}
-local DarkRed = {125,35,35}
 local PageWidth = 518
 local PageHeight = 690
 
-local function PropIsYes(name, default)
-  if props[name] == nil or props[name].Value == nil then
-    return default
+local function GetProperty(name, fallback)
+  if props[name] ~= nil and props[name].Value ~= nil then
+    return props[name].Value
   end
-  local value = tostring(props[name].Value)
-  return value == "Yes" or value == "true" or value == "1"
+  return fallback
+end
+
+local function PresetCount()
+  local count = math.floor(tonumber(GetProperty("Preset Count", 5)) or 5)
+  if count < 1 then
+    return 1
+  elseif count > 24 then
+    return 24
+  end
+  return count
+end
+
+local function PlaybackCount()
+  local count = math.floor(tonumber(GetProperty("Playback Count", 8)) or 8)
+  if count < 1 then
+    return 1
+  elseif count > 8 then
+    return 8
+  end
+  return count
 end
 
 local function AddText(text, x, y, w, h, size, align)
@@ -37,9 +54,11 @@ local function AddButton(name, x, y, w, h, legend, color, style)
     Style = "Button",
     ButtonStyle = style or "Trigger",
     Color = color or ButtonGray,
+    OffColor = ButtonGray,
+    UnlinkOffColor = true,
     Position = {x,y},
     Size = {w,h},
-    FontSize = 10
+    FontSize = 9
   }
 end
 
@@ -63,16 +82,6 @@ local function AddLed(name, x, y, color)
   }
 end
 
-local function AddFader(name, x, y)
-  layout[name] = {
-    PrettyName = name,
-    Style = "Fader",
-    Position = {x,y},
-    Size = {36,130},
-    FontSize = 8
-  }
-end
-
 local function AddGroupBox(title, x, y, w, h, fill)
   table.insert(graphics,{
     Type = "GroupBox",
@@ -90,9 +99,9 @@ local function AddHeader()
   table.insert(graphics,{Type = "GroupBox", Fill = BodyFill, StrokeWidth = 0, Position = {10,140}, Size = {PageWidth - 20,PageHeight - 150}})
   AddGroupBox("HEADER", 10, 10, PageWidth - 20, 120, HeaderFill)
   table.insert(graphics,{Type = "Image", Image = DechenLogo, Position = {20,20}, Size = {140,45}})
-  table.insert(graphics,{Type = "Image", Image = EloLogo, Position = {382,18}, Size = {76,60}})
-  AddText("DCH Elo IDS", 188, 32, 142, 20, 14)
-  AddText("MDC Monitor Control", 186, 54, 146, 16, 10)
+  AddText("Analog Way", 188, 28, 142, 18, 12)
+  AddText("Picturall Pro", 178, 48, 162, 24, 15)
+  AddText("Cue Stack Controller", 184, 72, 150, 16, 9)
   AddText("IP ADDRESS", 20, 74, 92, 14, 8, "Left")
   AddText("PORT", 118, 74, 30, 14, 8, "Left")
   AddText("STATUS", 150, 74, 108, 14, 8, "Left")
@@ -104,104 +113,82 @@ local function AddHeader()
   layout["ConnectionStatus"] = {PrettyName = "ConnectionStatus", Style = "Status", Position = {270,90}, Size = {102,25}, FontSize = 8}
 end
 
-local function AddPowerBlock()
-  AddButton("PowerOn", 54, 190, 100, 30, "Power On", ButtonBlue, "Toggle")
-  layout["PowerOn"].OffColor = ButtonGray
-  layout["PowerOn"].UnlinkOffColor = true
-  AddButton("PowerOff", 54, 225, 100, 30, "Power Off", Red, "Toggle")
-  layout["PowerOff"].OffColor = ButtonGray
-  layout["PowerOff"].UnlinkOffColor = true
-  layout["Power"] = {
-    PrettyName = "Power",
-    Legend = "Power",
-    Style = "Button",
-    ButtonStyle = "Toggle",
-    Color = ButtonGray,
-    OffColor = DarkRed,
-    UnlinkOffColor = true,
-    Position = {158,190},
-    Size = {100,66},
-    FontSize = 10
-  }
-  AddTextControl("PowerStatus", 54, 262, 124, 20, "Textdisplay")
-  AddText("ON", 184, 262, 22, 16, 8, "Left")
-  AddLed("PowerIsOn", 208, 262, Green)
-  AddText("OFF", 228, 262, 24, 16, 8, "Left")
-  AddLed("PowerIsOff", 252, 262, Red)
+local function AddPresetRow(ix, y)
+  AddText(tostring(ix), 52, y + 7, 20, 14, 8, "Center")
+  AddTextControl("Preset" .. ix .. "Name", 78, y, 96, 25, "Text")
+  AddTextControl("Preset" .. ix .. "Playback", 180, y, 34, 25, "Text")
+  AddTextControl("Preset" .. ix .. "CueStack", 220, y, 62, 25, "Text")
+  AddTextControl("Preset" .. ix .. "Command", 288, y, 120, 25, "Text")
+  AddButton("Preset" .. ix .. "Go", 416, y, 42, 25, "Go", ButtonBlue)
+  AddLed("Preset" .. ix .. "Active", 464, y + 4, Green)
 end
 
-local function AddSourceButtons(x, y)
-  local buttons = {
-    {"SourceHDMI1", "HDMI 1", "HDMI1Active"},
-    {"SourceHDMI2", "HDMI 2", "HDMI2Active"},
-    {"SourceDP", "DP", "DPActive"},
-    {"SourceUSBC", "USB-C", "USBCActive"}
-  }
-  for ix, item in ipairs(buttons) do
-    local col = (ix - 1) % 2
-    local row = math.floor((ix - 1) / 2)
-    AddButton(item[1], x + col * 104, y + row * 38, 100, 30, item[2], ix == 1 and ButtonBlue or ButtonGray)
-    AddLed(item[3], x + col * 104 + 82, y + row * 38 + 7, Green)
-  end
-  AddTextControl("SourceSelect", x, y + 86, 100, 24, "ComboBox")
-  AddTextControl("CurrentSource", x + 104, y + 86, 100, 24, "Textdisplay")
-end
-
-local function AddLevelColumn(levelName, upName, downName, x)
-  AddButton(upName, x, 202, 42, 42, "+", ButtonGray)
-  AddFader(levelName, x + 3, 248)
-  AddButton(downName, x, 393, 42, 42, "-", ButtonGray)
-end
-
-local function AddPictureControls()
-  AddText("BRIGHTNESS", 54, 544, 96, 14, 8)
-  AddText("CONTRAST", 162, 544, 96, 14, 8)
-  layout["Brightness"] = {PrettyName = "Brightness", Style = "Fader", Position = {84,564}, Size = {36,78}, FontSize = 8}
-  layout["Contrast"] = {PrettyName = "Contrast", Style = "Fader", Position = {192,564}, Size = {36,78}, FontSize = 8}
-  AddTextControl("BrightnessFeedback", 54, 648, 96, 20, "Textdisplay")
-  AddTextControl("ContrastFeedback", 162, 648, 96, 20, "Textdisplay")
-  AddButton("AutoAdjust", 302, 554, 80, 28, "Auto", ButtonGray)
-  AddButton("RecallDefaults", 390, 554, 80, 28, "Defaults", Red)
+local function AddPlaybackRow(ix, x, y)
+  AddButton("Playback" .. ix .. "Go", x, y, 42, 25, "PB " .. ix, ButtonBlue)
+  AddLed("Playback" .. ix .. "Active", x + 48, y + 4, Green)
+  AddTextControl("Playback" .. ix .. "GoCommand", x + 70, y, 118, 25, "Text")
 end
 
 local function AddControlPage()
   AddHeader()
-  AddGroupBox("POWER", 44, 160, 224, 134)
-  AddGroupBox("INPUTS", 44, 306, 224, 154)
-  AddGroupBox("PICTURE", 44, 518, 438, 164)
-  AddGroupBox("VOLUME", 312, 160, 82, 328)
-  AddPowerBlock()
-  AddSourceButtons(54, 335)
-  AddLevelColumn("Volume", "VolumeUp", "VolumeDown", 337)
-  AddTextControl("VolumeFeedback", 326, 444, 64, 24, "Textdisplay")
-  AddPictureControls()
+  AddGroupBox("CONNECTION / STATUS", 44, 160, 438, 110)
+  AddText("SERVER VERSION", 64, 194, 110, 14, 8, "Left")
+  AddTextControl("ServerVersion", 186, 190, 104, 24, "Textdisplay")
+  AddText("PLAYBACK", 64, 226, 110, 14, 8, "Left")
+  AddTextControl("ActivePlayback", 186, 222, 54, 24, "Textdisplay")
+  AddText("CUE STACK", 252, 226, 72, 14, 8, "Left")
+  AddTextControl("ActiveCueStack", 324, 222, 70, 24, "Textdisplay")
+  AddText("CUE", 64, 252, 110, 14, 8, "Left")
+  AddTextControl("ActiveCue", 186, 248, 54, 24, "Textdisplay")
+  AddText("STATE", 252, 252, 72, 14, 8, "Left")
+  AddTextControl("PlaybackState", 324, 248, 118, 24, "Textdisplay")
+
+  AddGroupBox("CUE STACKS / PRESETS", 44, 292, 438, 356)
+  AddText("#", 52, 322, 20, 14, 8)
+  AddText("NAME", 78, 322, 96, 14, 8, "Left")
+  AddText("PB", 180, 322, 34, 14, 8)
+  AddText("STACK", 220, 322, 62, 14, 8)
+  AddText("COMMAND", 288, 322, 120, 14, 8, "Left")
+  for ix = 1, PresetCount() do
+    local y = 342 + ((ix - 1) * 30)
+    if y <= 612 then
+      AddPresetRow(ix, y)
+    end
+  end
 end
 
-local function AddTouchPage()
+local function AddTechnicalPage()
   AddHeader()
-  AddGroupBox("TOUCH", 44, 160, 438, 110)
-  AddGroupBox("DIAGNOSTICS", 44, 292, 438, 194)
-  if PropIsYes("Enable Touch Control", true) then
-    AddButton("TouchEnabled", 74, 202, 120, 34, "Touch", ButtonGray, "Toggle")
-    AddText("TOUCH STATUS", 222, 197, 116, 14, 8, "Left")
-    AddTextControl("TouchStatus", 222, 215, 120, 24, "Textdisplay")
+  AddGroupBox("PLAYBACK GO", 44, 160, 438, 156)
+  AddText("GO", 64, 186, 42, 12, 8)
+  AddText("COMMAND", 134, 186, 118, 12, 8, "Left")
+  AddText("GO", 274, 186, 42, 12, 8)
+  AddText("COMMAND", 344, 186, 118, 12, 8, "Left")
+  for ix = 1, PlaybackCount() do
+    local col = (ix - 1) % 2
+    local row = math.floor((ix - 1) / 2)
+    AddPlaybackRow(ix, 64 + (col * 210), 202 + (row * 28))
   end
-  if PropIsYes("Enable Diagnostics", true) then
-    AddButton("ReadStatus", 74, 334, 120, 34, "Read Status", ButtonBlue)
-    AddText("COMMAND", 222, 329, 116, 14, 8, "Left")
-    AddTextControl("CommandStatus", 222, 347, 172, 24, "Textdisplay")
-    AddText("TEMPERATURE", 74, 394, 120, 14, 8, "Left")
-    AddTextControl("Temperature", 222, 390, 172, 24, "Textdisplay")
-    AddText("POWER HOURS", 74, 426, 120, 14, 8, "Left")
-    AddTextControl("PowerHours", 222, 422, 172, 24, "Textdisplay")
-    AddText("BACKLIGHT HOURS", 74, 458, 120, 14, 8, "Left")
-    AddTextControl("BacklightHours", 222, 454, 172, 24, "Textdisplay")
-  end
+
+  AddGroupBox("TECHNICAL", 44, 338, 438, 154)
+  AddButton("PollFeedback", 74, 204, 120, 34, "Poll Feedback", ButtonBlue)
+  layout["PollFeedback"].Position = {74, 374}
+  AddText("COMMAND", 222, 368, 116, 14, 8, "Left")
+  AddTextControl("CommandStatus", 222, 386, 200, 24, "Textdisplay")
+  AddText("ACTIVE PLAYBACK", 74, 436, 126, 14, 8, "Left")
+  AddTextControl("ActivePlayback", 222, 432, 60, 24, "Textdisplay")
+  AddText("ACTIVE CUE STACK", 74, 468, 126, 14, 8, "Left")
+  AddTextControl("ActiveCueStack", 222, 464, 100, 24, "Textdisplay")
+
+  AddGroupBox("PROTOCOL NOTE", 44, 526, 438, 126)
+  AddText("Picturall uses a text based TCP/IP external control protocol on port 11000.", 64, 560, 388, 20, 9, "Left")
+  AddText("Use Picturall Commander logging or Companion Learn to capture exact custom commands.", 64, 590, 388, 20, 9, "Left")
+  AddText("Playback Go buttons send their configured PlaybackXGoCommand text.", 64, 620, 388, 20, 9, "Left")
 end
 
 local CurrentPage = PageNames[props["page_index"].Value]
 if CurrentPage == "Control" then
   AddControlPage()
-elseif CurrentPage == "Touch" then
-  AddTouchPage()
+elseif CurrentPage == "Technical" then
+  AddTechnicalPage()
 end

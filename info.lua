@@ -1,8 +1,8 @@
 PluginInfo = {
-  Name = "DCH~ELO~Elo IDS Monitor",
+  Name = "DCH~Analog Way~Picturall Pro",
   Version = "0.0",
-  BuildVersion = "1.0.3.0",
-  Id = "55cb53bb-7043-4097-bfb1-d7fb12e66d00",
+  BuildVersion = "0.1.0.0",
+  Id = "ee9e56e9-f3fc-42d1-ba62-13911a5923f3",
   Author = "DCH",
-  Description = "Elo IDS monitor MDC control plugin"
+  Description = "Analog Way Picturall Pro cue stack and playback control plugin"
 }

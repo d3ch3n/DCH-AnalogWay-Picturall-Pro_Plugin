@@ -1,1 +1,1 @@
--- No internal wiring is required for the Elo IDS plugin.
+-- No internal wiring is required for the Picturall Pro plugin.
