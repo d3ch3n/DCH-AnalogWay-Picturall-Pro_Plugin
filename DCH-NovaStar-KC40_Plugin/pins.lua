@@ -1,1 +1,0 @@
--- No unmanaged pins are required for direct HTTP control.
