@@ -1,0 +1,1 @@
+-- No internal wiring is required for the NovaStar KC40 plugin.

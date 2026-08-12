@@ -1,0 +1,1 @@
+-- No internal Q-SYS components are required for direct HTTP control.
